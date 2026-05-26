@@ -1,0 +1,659 @@
+import logging
+import traceback
+
+from flask import Flask, jsonify, render_template_string, request
+
+from forecaster import get_full_forecast, load_model
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("portfolio")
+
+# Create website app
+app = Flask(__name__)
+
+# ----------------------------
+# Portfolio data (edit freely)
+# ----------------------------
+PROFILE = {
+    "name": "Achint Rai",
+    "tagline": "Python Developer | Data Enthusiast | Web Builder",
+    "about": (
+        "Hi, I'm Achint. I build clean, practical web apps and data tools "
+        "using Python, Flask, and modern web technologies. Below you will "
+        "find a curated list of my portfolio projects."
+    ),
+    "email": "achintrai2211@gmail.com",
+    "github": "https://github.com/",
+    "linkedin": "https://linkedin.com/",
+}
+
+PROJECTS = [
+    {
+        "title": "Personal Website",
+        "category": "Web Development",
+        "description": "A clean personal website built using Python and Flask, "
+                       "featuring routing, templates, and responsive design.",
+        "tech": ["Python", "Flask", "HTML", "CSS"],
+        "link": "#",
+    },
+    {
+        "title": "Data Analysis Dashboard",
+        "category": "Data Science",
+        "description": "An interactive dashboard that visualizes datasets "
+                       "using Pandas and Plotly for meaningful insights.",
+        "tech": ["Python", "Pandas", "Plotly", "Flask"],
+        "link": "#",
+    },
+    {
+        "title": "Weather App",
+        "category": "API Integration + ML",
+        "description": "A weather forecasting app that fetches live data "
+                       "from Open-Meteo and refines it with a trained "
+                       "scikit-learn model.",
+        "tech": ["Python", "Flask", "REST API", "scikit-learn"],
+        "link": "/projects/weather",
+    },
+    {
+        "title": "To-Do List Manager",
+        "category": "Productivity",
+        "description": "A task management app with add, edit, delete, "
+                       "and filter features backed by a small database.",
+        "tech": ["Python", "Flask", "SQLite"],
+        "link": "#",
+    },
+    {
+        "title": "Machine Learning Model",
+        "category": "Machine Learning",
+        "description": "A classifier trained on real-world data with an "
+                       "interactive web interface for predictions.",
+        "tech": ["Python", "scikit-learn", "Flask"],
+        "link": "#",
+    },
+    {
+        "title": "Portfolio Website",
+        "category": "Web Development",
+        "description": "This very website — an organised portfolio listing "
+                       "built with Flask and modern CSS.",
+        "tech": ["Python", "Flask", "HTML", "CSS"],
+        "link": "#",
+    },
+]
+
+# ----------------------------
+# Base HTML layout (shared)
+# ----------------------------
+BASE_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} | {{ profile.name }}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #f4f7fb;
+            color: #222;
+            line-height: 1.6;
+        }
+        /* ---- Navigation ---- */
+        nav {
+            background: #0b2545;
+            padding: 15px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+        }
+        nav .brand {
+            color: white;
+            font-size: 22px;
+            font-weight: bold;
+            letter-spacing: 1px;
+        }
+        nav ul {
+            list-style: none;
+            display: flex;
+            gap: 25px;
+        }
+        nav ul li a {
+            color: #e0e6ed;
+            text-decoration: none;
+            font-size: 16px;
+            padding: 6px 10px;
+            border-radius: 6px;
+            transition: background 0.2s;
+        }
+        nav ul li a:hover { background: #1b3a6b; }
+
+        /* ---- Hero ---- */
+        .hero {
+            text-align: center;
+            padding: 80px 20px;
+            background: linear-gradient(135deg, #0b2545, #1b3a6b);
+            color: white;
+        }
+        .hero h1 { font-size: 48px; margin-bottom: 10px; }
+        .hero p  { font-size: 20px; opacity: 0.9; }
+        .hero .btn {
+            display: inline-block;
+            margin-top: 25px;
+            background: #ffb703;
+            color: #0b2545;
+            padding: 12px 28px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: bold;
+            transition: transform 0.2s;
+        }
+        .hero .btn:hover { transform: translateY(-2px); }
+
+        /* ---- Sections ---- */
+        .container { max-width: 1100px; margin: 0 auto; padding: 60px 20px; }
+        h2 {
+            text-align: center;
+            color: #0b2545;
+            margin-bottom: 40px;
+            font-size: 34px;
+        }
+
+        /* ---- Projects grid ---- */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 25px;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+        }
+        .card h3 { color: #0b2545; margin-bottom: 8px; }
+        .card .cat {
+            color: #ffb703;
+            font-size: 13px;
+            font-weight: bold;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+        }
+        .card p { color: #555; margin-bottom: 15px; }
+        .tech {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 15px;
+        }
+        .tech span {
+            background: #eef2f8;
+            color: #0b2545;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+        }
+        .card a.view {
+            color: #0b2545;
+            text-decoration: none;
+            font-weight: bold;
+            border-bottom: 2px solid #ffb703;
+        }
+
+        /* ---- About & Contact ---- */
+        .about-box, .contact-box {
+            background: white;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+        }
+        .contact-box a { color: #0b2545; text-decoration: none; font-weight: bold; }
+
+        /* ---- Footer ---- */
+        footer {
+            background: #0b2545;
+            color: #cfd8e3;
+            text-align: center;
+            padding: 20px;
+            margin-top: 60px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="brand">{{ profile.name }}</div>
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/projects">Projects</a></li>
+            <li><a href="/about">About</a></li>
+            <li><a href="/contact">Contact</a></li>
+        </ul>
+    </nav>
+
+    {{ content|safe }}
+
+    <footer>
+        &copy; 2026 {{ profile.name }}. Built with Python + Flask.
+    </footer>
+</body>
+</html>
+"""
+
+
+def render_page(title, content_html):
+    """Helper to render a page inside the shared base layout."""
+    return render_template_string(
+        BASE_TEMPLATE,
+        title=title,
+        profile=PROFILE,
+        content=content_html,
+    )
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.route("/")
+def home():
+    content = f"""
+    <section class="hero">
+        <h1>{PROFILE['name']}</h1>
+        <p>{PROFILE['tagline']}</p>
+        <a href="/projects" class="btn">View My Portfolio</a>
+    </section>
+    <section class="container">
+        <h2>Featured Projects</h2>
+        <div class="grid">
+    """
+    # Show 3 featured cards on the home page
+    for p in PROJECTS[:3]:
+        tech_tags = "".join(f"<span>{t}</span>" for t in p["tech"])
+        content += f"""
+        <div class="card">
+            <div class="cat">{p['category']}</div>
+            <h3>{p['title']}</h3>
+            <p>{p['description']}</p>
+            <div class="tech">{tech_tags}</div>
+            <a class="view" href="{p['link']}">View Project &rarr;</a>
+        </div>
+        """
+    content += "</div></section>"
+    return render_page("Home", content)
+
+
+@app.route("/projects")
+def projects():
+    content = """
+    <section class="container">
+        <h2>My Portfolio</h2>
+        <div class="grid">
+    """
+    for p in PROJECTS:
+        tech_tags = "".join(f"<span>{t}</span>" for t in p["tech"])
+        content += f"""
+        <div class="card">
+            <div class="cat">{p['category']}</div>
+            <h3>{p['title']}</h3>
+            <p>{p['description']}</p>
+            <div class="tech">{tech_tags}</div>
+            <a class="view" href="{p['link']}">View Project &rarr;</a>
+        </div>
+        """
+    content += "</div></section>"
+    return render_page("Projects", content)
+
+
+@app.route("/about")
+def about():
+    content = f"""
+    <section class="container">
+        <h2>About Me</h2>
+        <div class="about-box">
+            <p>{PROFILE['about']}</p>
+        </div>
+    </section>
+    """
+    return render_page("About", content)
+
+
+@app.route("/contact")
+def contact():
+    content = f"""
+    <section class="container">
+        <h2>Get In Touch</h2>
+        <div class="contact-box">
+            <p>Feel free to reach out for collaborations or opportunities.</p>
+            <br>
+            <p>Email: <a href="mailto:{PROFILE['email']}">{PROFILE['email']}</a></p>
+            <p>GitHub: <a href="{PROFILE['github']}" target="_blank">{PROFILE['github']}</a></p>
+            <p>LinkedIn: <a href="{PROFILE['linkedin']}" target="_blank">{PROFILE['linkedin']}</a></p>
+        </div>
+    </section>
+    """
+    return render_page("Contact", content)
+
+
+# ----------------------------
+# Weather App project page
+# ----------------------------
+WEATHER_PAGE_HTML = """
+<section class="container">
+    <h2>Weather App</h2>
+    <p style="text-align:center; color:#555; max-width:720px; margin:-20px auto 30px;">
+        Live numerical weather forecasts from
+        <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a>,
+        refined for the next 24 hours by a scikit-learn HistGradientBoostingRegressor
+        trained on two years of hourly reanalysis across twelve climate-diverse cities.
+    </p>
+
+    <div class="weather-search">
+        <form id="search-form" autocomplete="off">
+            <input id="city-input" type="text"
+                   placeholder="Enter a city, e.g. London"
+                   aria-label="City" required>
+            <button type="submit" class="btn-primary">Forecast</button>
+        </form>
+        <p id="status" class="status"></p>
+    </div>
+
+    <div id="results" hidden>
+        <div class="card current-card">
+            <div class="current-main">
+                <div class="current-temp"><span id="cur-temp">--</span><span class="unit">&deg;C</span></div>
+                <div class="current-meta">
+                    <h3 id="cur-location">--</h3>
+                    <p id="cur-condition">--</p>
+                </div>
+            </div>
+            <div class="current-grid">
+                <div><span class="label">Humidity</span><span id="cur-humidity">--</span></div>
+                <div><span class="label">Wind</span><span id="cur-wind">--</span></div>
+                <div><span class="label">Precipitation</span><span id="cur-precip">--</span></div>
+                <div><span class="label">ML model</span><span id="ml-status">--</span></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>7-Day Outlook</h3>
+            <div id="daily-strip" class="daily-strip"></div>
+        </div>
+
+        <div class="card">
+            <h3>Next 24 Hours &mdash; NWP vs ML refinement</h3>
+            <p style="color:#666;font-size:14px;margin:0 0 12px;">
+                Solid line: official numerical forecast.
+                Dashed: local ML prediction.
+                Dotted: blended ensemble (70% NWP + 30% ML).
+            </p>
+            <div class="chart-wrap"><canvas id="hourly-chart"></canvas></div>
+        </div>
+
+        <div class="card">
+            <h3>Hourly Detail (next 48h)</h3>
+            <div style="overflow-x:auto;">
+            <table id="hourly-table">
+                <thead>
+                    <tr><th>Time</th><th>Temp</th><th>Precip</th><th>Wind</th><th>Humidity</th></tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+            </div>
+        </div>
+    </div>
+</section>
+
+<style>
+    .weather-search { text-align:center; margin-bottom:30px; }
+    #search-form { display:flex; gap:8px; justify-content:center;
+                   max-width:560px; margin:0 auto; }
+    #search-form input {
+        flex:1; padding:12px 16px;
+        background:white; border:1px solid #cdd6e0;
+        color:#222; border-radius:8px; font-size:16px;
+    }
+    #search-form input:focus { outline:2px solid #ffb703; border-color:transparent; }
+    .btn-primary {
+        padding:12px 22px; background:#ffb703; color:#0b2545;
+        font-weight:bold; border:0; border-radius:8px; cursor:pointer; font-size:16px;
+    }
+    .btn-primary:hover { transform:translateY(-1px); }
+    .status { min-height:1.4em; color:#555; margin-top:12px; }
+    .status.error { color:#c93636; }
+
+    #results { display:grid; gap:18px; }
+    #results .card { padding:24px; }
+    .current-main { display:flex; align-items:center; gap:24px; flex-wrap:wrap; margin-bottom:18px; }
+    .current-temp { font-size:64px; font-weight:200; line-height:1; color:#0b2545; }
+    .current-temp .unit { font-size:22px; color:#888; margin-left:4px; }
+    .current-meta h3 { color:#0b2545; margin:0; }
+    .current-meta p { margin:4px 0 0; color:#555; }
+    .current-grid {
+        display:grid;
+        grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
+        gap:12px;
+    }
+    .current-grid > div {
+        background:#eef2f8; padding:12px 14px; border-radius:8px;
+        display:flex; flex-direction:column;
+    }
+    .current-grid .label {
+        color:#666; font-size:12px;
+        text-transform:uppercase; letter-spacing:0.06em;
+    }
+    .current-grid > div > span:last-child {
+        font-size:18px; font-weight:600; color:#0b2545; margin-top:4px;
+    }
+    .daily-strip {
+        display:grid; grid-template-columns:repeat(7, minmax(0, 1fr)); gap:8px;
+    }
+    .daily-strip .day {
+        background:#eef2f8; padding:12px 8px;
+        border-radius:8px; text-align:center; font-size:14px;
+    }
+    .daily-strip .day .dow { color:#666; font-size:12px; }
+    .daily-strip .day .icon { font-size:26px; margin:4px 0; }
+    .daily-strip .day .hi { font-weight:700; color:#0b2545; }
+    .daily-strip .day .lo { color:#888; }
+
+    .chart-wrap { position:relative; height:320px; }
+
+    #hourly-table { width:100%; border-collapse:collapse; font-size:14px; }
+    #hourly-table th, #hourly-table td {
+        padding:8px 10px; text-align:left; border-bottom:1px solid #e6ebf2;
+    }
+    #hourly-table th {
+        color:#666; font-weight:500; font-size:12px;
+        text-transform:uppercase; letter-spacing:0.05em;
+    }
+
+    @media (max-width: 640px) {
+        .daily-strip { grid-template-columns:repeat(4, 1fr); }
+        .current-temp { font-size:48px; }
+    }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const WMO = {
+    0:{txt:"Clear sky",icon:"☀️"}, 1:{txt:"Mainly clear",icon:"🌤️"},
+    2:{txt:"Partly cloudy",icon:"⛅"}, 3:{txt:"Overcast",icon:"☁️"},
+    45:{txt:"Fog",icon:"🌫️"}, 48:{txt:"Rime fog",icon:"🌫️"},
+    51:{txt:"Light drizzle",icon:"🌦️"}, 53:{txt:"Drizzle",icon:"🌦️"},
+    55:{txt:"Heavy drizzle",icon:"🌧️"},
+    61:{txt:"Light rain",icon:"🌦️"}, 63:{txt:"Rain",icon:"🌧️"},
+    65:{txt:"Heavy rain",icon:"🌧️"},
+    71:{txt:"Light snow",icon:"🌨️"}, 73:{txt:"Snow",icon:"❄️"},
+    75:{txt:"Heavy snow",icon:"❄️"},
+    80:{txt:"Showers",icon:"🌦️"}, 81:{txt:"Heavy showers",icon:"🌧️"},
+    82:{txt:"Violent showers",icon:"⛈️"},
+    95:{txt:"Thunderstorm",icon:"⛈️"}, 96:{txt:"Storm w/ hail",icon:"⛈️"},
+    99:{txt:"Severe storm",icon:"⛈️"},
+};
+const wmo = (c) => WMO[c] || { txt: "—", icon: "•" };
+let chartInstance = null;
+
+function setStatus(msg, isError) {
+    const el = document.getElementById("status");
+    el.textContent = msg || "";
+    el.classList.toggle("error", !!isError);
+}
+function fmtTime(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString([], { weekday: "short", hour: "numeric" });
+}
+async function fetchForecast(city) {
+    const r = await fetch(`/api/forecast?city=${encodeURIComponent(city)}`);
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(b.error || `HTTP ${r.status}`);
+    return b;
+}
+
+function renderCurrent(data) {
+    const loc = data.location || {}, cur = data.current || {};
+    document.getElementById("cur-temp").textContent =
+        cur.temperature_2m != null ? Math.round(cur.temperature_2m) : "--";
+    document.getElementById("cur-location").textContent =
+        [loc.name, loc.admin1, loc.country].filter(Boolean).join(", ");
+    const w = wmo(cur.weather_code);
+    document.getElementById("cur-condition").textContent = `${w.icon}  ${w.txt}`;
+    document.getElementById("cur-humidity").textContent =
+        cur.relative_humidity_2m != null ? `${cur.relative_humidity_2m}%` : "—";
+    document.getElementById("cur-wind").textContent =
+        cur.wind_speed_10m != null ? `${cur.wind_speed_10m} km/h` : "—";
+    document.getElementById("cur-precip").textContent =
+        cur.precipitation != null ? `${cur.precipitation} mm` : "—";
+    document.getElementById("ml-status").textContent =
+        data.ml_available ? "Active" : "Not trained";
+}
+function renderDaily(data) {
+    const d = data.daily || {};
+    const strip = document.getElementById("daily-strip");
+    strip.innerHTML = "";
+    (d.time || []).forEach((t, i) => {
+        const date = new Date(t);
+        const dow = date.toLocaleDateString([], { weekday: "short" });
+        const hi = Math.round(d.temperature_2m_max?.[i]);
+        const lo = Math.round(d.temperature_2m_min?.[i]);
+        const w = wmo(d.weather_code?.[i]);
+        const p = d.precipitation_sum?.[i] ?? 0;
+        const card = document.createElement("div");
+        card.className = "day";
+        card.innerHTML =
+            `<div class="dow">${dow}</div>` +
+            `<div class="icon" title="${w.txt}">${w.icon}</div>` +
+            `<div><span class="hi">${hi}°</span> / <span class="lo">${lo}°</span></div>` +
+            `<div class="dow">${p} mm</div>`;
+        strip.appendChild(card);
+    });
+}
+function renderChart(data) {
+    const hourly = data.hourly || {};
+    const refinement = data.ml_refinement || [];
+    const times = (hourly.time || []).slice(0, 24);
+    const nwp = (hourly.temperature_2m || []).slice(0, 24);
+    const refByTime = new Map(refinement.map(r => [r.time, r]));
+    const ml = times.map(t => refByTime.get(t)?.ml_temperature_c ?? null);
+    const blended = times.map(t => refByTime.get(t)?.blended_temperature_c ?? null);
+
+    const ctx = document.getElementById("hourly-chart").getContext("2d");
+    if (chartInstance) chartInstance.destroy();
+    chartInstance = new Chart(ctx, {
+        type: "line",
+        data: { labels: times.map(fmtTime), datasets: [
+            { label: "NWP forecast (°C)", data: nwp,
+              borderColor: "#0b2545", backgroundColor: "rgba(11,37,69,0.10)",
+              fill: true, tension: 0.35, borderWidth: 2, pointRadius: 0 },
+            { label: "ML refinement (°C)", data: ml,
+              borderColor: "#ffb703", borderDash: [6, 4],
+              tension: 0.35, borderWidth: 2, pointRadius: 0, spanGaps: true },
+            { label: "Blended ensemble (°C)", data: blended,
+              borderColor: "#7e57c2", borderDash: [2, 3],
+              tension: 0.35, borderWidth: 2, pointRadius: 0, spanGaps: true },
+        ]},
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: { legend: { labels: { color: "#222" } } },
+            scales: {
+                x: { ticks: { color: "#666" }, grid: { color: "rgba(0,0,0,0.06)" } },
+                y: { ticks: { color: "#666" }, grid: { color: "rgba(0,0,0,0.06)" } },
+            },
+        },
+    });
+}
+function renderTable(data) {
+    const h = data.hourly || {};
+    const tbody = document.querySelector("#hourly-table tbody");
+    tbody.innerHTML = "";
+    const n = Math.min(48, (h.time || []).length);
+    for (let i = 0; i < n; i++) {
+        const tr = document.createElement("tr");
+        tr.innerHTML =
+            `<td>${fmtTime(h.time[i])}</td>` +
+            `<td>${Math.round(h.temperature_2m?.[i])}°</td>` +
+            `<td>${(h.precipitation?.[i] ?? 0).toFixed(1)} mm</td>` +
+            `<td>${Math.round(h.wind_speed_10m?.[i] ?? 0)} km/h</td>` +
+            `<td>${h.relative_humidity_2m?.[i] ?? "—"}%</td>`;
+        tbody.appendChild(tr);
+    }
+}
+async function handleSubmit(e) {
+    e.preventDefault();
+    const city = document.getElementById("city-input").value.trim();
+    if (!city) return;
+    setStatus("Loading…");
+    document.getElementById("results").hidden = true;
+    try {
+        const data = await fetchForecast(city);
+        renderCurrent(data); renderDaily(data); renderChart(data); renderTable(data);
+        document.getElementById("results").hidden = false;
+        setStatus("");
+    } catch (err) {
+        setStatus(`Couldn't load forecast: ${err.message}`, true);
+    }
+}
+document.addEventListener("DOMContentLoaded", () => {
+    document.getElementById("search-form").addEventListener("submit", handleSubmit);
+});
+</script>
+"""
+
+
+@app.route("/projects/weather")
+def weather_project():
+    """Weather forecasting page (linked from the 'View Project' button)."""
+    return render_page("Weather App", WEATHER_PAGE_HTML)
+
+
+@app.route("/api/forecast")
+def api_forecast():
+    """JSON endpoint that backs the weather page."""
+    city = (request.args.get("city") or "").strip()
+    if not city:
+        return jsonify({"error": "Missing ?city= parameter"}), 400
+    try:
+        return jsonify(get_full_forecast(city))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        log.error("Forecast failed for %r: %s\n%s", city, e, traceback.format_exc())
+        return jsonify({"error": "Forecast service is temporarily unavailable."}), 502
+
+
+# ----------------------------
+# Start server
+# ----------------------------
+if __name__ == "__main__":
+    log.info("ML model %s",
+             "loaded" if load_model() is not None
+             else "NOT loaded — run `python train_model.py` first")
+    app.run(debug=True, use_reloader=False, port=5050)
