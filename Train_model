@@ -1,0 +1,201 @@
+"""
+train_model.py
+--------------
+Train the temperature-refinement model used by `forecaster.py`.
+
+Approach
+- Download ~2 years of hourly weather history for a diverse set of
+  cities from Open-Meteo's free archive API.
+- Build supervised examples: at each hour t, predict temperature at
+  t + 24h using features derived from observations available at t.
+- Train a HistGradientBoostingRegressor (fast, handles missing values,
+  no need for feature scaling).
+- Save the model to model.joblib for the Flask app to load.
+
+Run once after install:
+    python train_model.py
+
+Re-run periodically (e.g. monthly) to refresh on recent climatology.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from datetime import date, timedelta
+from typing import Optional
+
+import joblib
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
+
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.joblib")
+
+# Training cities — chosen for climate diversity so the model learns
+# patterns that transfer to other locations the user might query.
+TRAINING_CITIES = [
+    {"name": "London",       "lat": 51.5074, "lon": -0.1278},
+    {"name": "New York",     "lat": 40.7128, "lon": -74.0060},
+    {"name": "Tokyo",        "lat": 35.6762, "lon": 139.6503},
+    {"name": "Sydney",       "lat": -33.8688, "lon": 151.2093},
+    {"name": "Mumbai",       "lat": 19.0760, "lon": 72.8777},
+    {"name": "Cairo",        "lat": 30.0444, "lon": 31.2357},
+    {"name": "Sao Paulo",    "lat": -23.5505, "lon": -46.6333},
+    {"name": "Moscow",       "lat": 55.7558, "lon": 37.6173},
+    {"name": "Cape Town",    "lat": -33.9249, "lon": 18.4241},
+    {"name": "Reykjavik",    "lat": 64.1466, "lon": -21.9426},
+    {"name": "Singapore",    "lat": 1.3521,  "lon": 103.8198},
+    {"name": "Vancouver",    "lat": 49.2827, "lon": -123.1207},
+]
+
+YEARS_OF_HISTORY = 2
+HORIZON_HOURS = 24
+
+
+# --- Data fetching ----------------------------------------------------------
+
+
+def fetch_city_history(lat: float, lon: float, start: date, end: date) -> pd.DataFrame:
+    """Pull hourly archive data for a city. Uses chunked requests if needed."""
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "hourly": ",".join(
+            [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "precipitation",
+                "wind_speed_10m",
+                "surface_pressure",
+            ]
+        ),
+        "timezone": "UTC",
+    }
+    resp = requests.get(ARCHIVE_URL, params=params, timeout=60)
+    resp.raise_for_status()
+    h = resp.json().get("hourly", {})
+    if not h or "time" not in h:
+        return pd.DataFrame()
+    df = pd.DataFrame(h)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df.set_index("time").sort_index()
+
+
+# --- Feature engineering ----------------------------------------------------
+
+
+def make_training_frame(df: pd.DataFrame, lat: float, lon: float) -> pd.DataFrame:
+    """Build features + target column from a single city's hourly history."""
+    if df.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(index=df.index)
+    out["lat"] = lat
+    out["lon"] = lon
+    hours = df.index.hour
+    doys = df.index.dayofyear
+    out["hour_sin"] = np.sin(2 * np.pi * hours / 24.0)
+    out["hour_cos"] = np.cos(2 * np.pi * hours / 24.0)
+    out["doy_sin"] = np.sin(2 * np.pi * doys / 365.25)
+    out["doy_cos"] = np.cos(2 * np.pi * doys / 365.25)
+
+    t = df["temperature_2m"]
+    out["lag_1h"] = t                                    # current obs
+    out["lag_24h"] = t.shift(24)
+    out["lag_168h"] = t.shift(168)
+    out["mean_7d"] = t.rolling(window=24 * 7, min_periods=24).mean()
+    out["std_7d"] = t.rolling(window=24 * 7, min_periods=24).std()
+    out["humidity"] = df.get("relative_humidity_2m", pd.Series(index=df.index, dtype=float))
+    out["pressure"] = df.get("surface_pressure", pd.Series(index=df.index, dtype=float))
+
+    # Target: temperature HORIZON_HOURS into the future
+    out["target"] = t.shift(-HORIZON_HOURS)
+
+    return out.dropna()
+
+
+FEATURE_COLS = [
+    "lat", "lon",
+    "hour_sin", "hour_cos", "doy_sin", "doy_cos",
+    "lag_1h", "lag_24h", "lag_168h",
+    "mean_7d", "std_7d",
+    "humidity", "pressure",
+]
+
+
+# --- Training ---------------------------------------------------------------
+
+
+def main() -> int:
+    end = date.today() - timedelta(days=3)         # archive lags ~2 days
+    start = end - timedelta(days=365 * YEARS_OF_HISTORY)
+    print(f"Fetching {YEARS_OF_HISTORY}y of hourly history "
+          f"({start} to {end}) for {len(TRAINING_CITIES)} cities...")
+
+    frames = []
+    for city in TRAINING_CITIES:
+        try:
+            print(f"  - {city['name']:>12} ", end="", flush=True)
+            df = fetch_city_history(city["lat"], city["lon"], start, end)
+            tf = make_training_frame(df, city["lat"], city["lon"])
+            print(f"{len(tf):>7,} rows")
+            frames.append(tf)
+            time.sleep(1.0)  # be polite to the free API
+        except Exception as e:
+            print(f"FAILED: {e}")
+
+    if not frames:
+        print("No data fetched. Aborting.", file=sys.stderr)
+        return 1
+
+    full = pd.concat(frames)
+    print(f"\nTotal training rows: {len(full):,}")
+
+    X = full[FEATURE_COLS].values
+    y = full["target"].values
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.15, random_state=42, shuffle=True
+    )
+
+    print("Training HistGradientBoostingRegressor...")
+    model = HistGradientBoostingRegressor(
+        max_iter=400,
+        learning_rate=0.05,
+        max_depth=8,
+        min_samples_leaf=40,
+        l2_regularization=0.1,
+        random_state=42,
+    )
+    model.fit(X_train, y_train)
+
+    pred = model.predict(X_val)
+    mae = mean_absolute_error(y_val, pred)
+    rmse = float(np.sqrt(mean_squared_error(y_val, pred)))
+    print(f"\nValidation MAE:  {mae:.2f} °C")
+    print(f"Validation RMSE: {rmse:.2f} °C")
+
+    # Persistence baseline (predict t+24h = t) for sanity-checking
+    persistence = X_val[:, FEATURE_COLS.index("lag_1h")]
+    base_mae = mean_absolute_error(y_val, persistence)
+    print(f"Persistence MAE (baseline): {base_mae:.2f} °C")
+    if mae < base_mae:
+        print(f"=> Model beats persistence by {base_mae - mae:.2f} °C MAE.")
+    else:
+        print("=> WARNING: model not beating persistence; consider more data.")
+
+    joblib.dump(model, MODEL_PATH)
+    print(f"\nSaved model -> {MODEL_PATH}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
