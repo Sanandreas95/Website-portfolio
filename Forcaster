@@ -1,0 +1,341 @@
+"""
+forecaster.py
+-------------
+Core weather-forecasting logic.
+
+Pipeline
+1. Geocode a city name -> (lat, lon) via Open-Meteo's geocoding API.
+2. Fetch the official numerical-weather-prediction (NWP) forecast from
+   Open-Meteo for the next 7 days (temperature, precipitation, wind).
+3. Pull the past 14 days of hourly observations for the same location
+   from Open-Meteo's archive API.
+4. Feed engineered features (cyclical time, lat/lon, lag values, rolling
+   stats) into a pre-trained scikit-learn model to produce an ML
+   prediction of temperature for each hour of the next 24h.
+5. Blend the NWP forecast with the ML prediction (weighted average) so
+   the website can show both signals plus the ensemble.
+
+The model itself is trained by `train_model.py`. This file is the
+runtime: it loads the saved model and produces forecasts on demand.
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+import joblib
+import numpy as np
+import pandas as pd
+import requests
+
+# --- Configuration -----------------------------------------------------------
+
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.joblib")
+
+# Forecast horizon for the ML refinement (hours ahead)
+ML_HORIZON_HOURS = 24
+
+# Blend weight: how much trust to give the local ML model vs. the NWP API.
+# The NWP is much more sophisticated globally, so we keep its weight high.
+BLEND_NWP_WEIGHT = 0.7
+BLEND_ML_WEIGHT = 0.3
+
+REQUEST_TIMEOUT = 15  # seconds
+
+
+# --- API helpers -------------------------------------------------------------
+
+
+def geocode_city(name: str) -> dict[str, Any]:
+    """Resolve a city name to coordinates and metadata."""
+    resp = requests.get(
+        GEOCODE_URL,
+        params={"name": name, "count": 1, "language": "en", "format": "json"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("results") or []
+    if not results:
+        raise ValueError(f"No location found for '{name}'.")
+    r = results[0]
+    return {
+        "name": r["name"],
+        "country": r.get("country", ""),
+        "admin1": r.get("admin1", ""),
+        "latitude": r["latitude"],
+        "longitude": r["longitude"],
+        "timezone": r.get("timezone", "UTC"),
+    }
+
+
+def fetch_nwp_forecast(lat: float, lon: float, timezone_str: str = "auto") -> dict[str, Any]:
+    """Fetch the official 7-day forecast from Open-Meteo."""
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": timezone_str,
+        "hourly": ",".join(
+            [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "precipitation",
+                "precipitation_probability",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "weather_code",
+                "surface_pressure",
+            ]
+        ),
+        "daily": ",".join(
+            [
+                "temperature_2m_max",
+                "temperature_2m_min",
+                "precipitation_sum",
+                "precipitation_probability_max",
+                "wind_speed_10m_max",
+                "weather_code",
+                "sunrise",
+                "sunset",
+            ]
+        ),
+        "current": ",".join(
+            [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "precipitation",
+                "wind_speed_10m",
+                "weather_code",
+            ]
+        ),
+        "forecast_days": 7,
+    }
+    resp = requests.get(FORECAST_URL, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_history(lat: float, lon: float, days: int = 14) -> pd.DataFrame:
+    """Pull recent hourly history for use as ML model inputs (lag features)."""
+    end = datetime.now(timezone.utc).date() - timedelta(days=2)  # archive lags ~2d
+    start = end - timedelta(days=days)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "hourly": ",".join(
+            [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "precipitation",
+                "wind_speed_10m",
+                "surface_pressure",
+            ]
+        ),
+        "timezone": "UTC",
+    }
+    resp = requests.get(ARCHIVE_URL, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    h = resp.json().get("hourly", {})
+    if not h or "time" not in h:
+        return pd.DataFrame()
+    df = pd.DataFrame(h)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df.set_index("time").sort_index()
+
+
+# --- Feature engineering ----------------------------------------------------
+
+
+def build_features(history: pd.DataFrame, lat: float, lon: float, target_time: pd.Timestamp) -> Optional[np.ndarray]:
+    """
+    Construct the feature row used by the ML model to predict the
+    temperature at `target_time`. Returns None if we lack data.
+
+    Features (must match train_model.py exactly):
+        lat, lon,
+        sin/cos of hour-of-day, sin/cos of day-of-year,
+        lag_1h, lag_24h, lag_168h temperature,
+        7-day mean temperature, 7-day std temperature,
+        last-known humidity, last-known pressure
+    """
+    if history.empty or "temperature_2m" not in history.columns:
+        return None
+
+    # Lag references must exist in the history we pulled.
+    # We can only use lags relative to the most recent observation we have.
+    last_obs_time = history.index.max()
+    horizon = (target_time - last_obs_time).total_seconds() / 3600.0
+    if horizon <= 0:
+        return None
+
+    def get_temp(offset_hours: float) -> Optional[float]:
+        """Temperature at last_obs_time minus offset_hours."""
+        ts = last_obs_time - pd.Timedelta(hours=offset_hours)
+        if ts in history.index:
+            v = history.loc[ts, "temperature_2m"]
+            return float(v) if pd.notna(v) else None
+        return None
+
+    lag_1 = get_temp(0)        # most recent observation
+    lag_24 = get_temp(24)      # ~24h before last obs
+    lag_168 = get_temp(168)    # ~1 week before last obs
+
+    if lag_1 is None or lag_24 is None or lag_168 is None:
+        return None
+
+    last_week = history.tail(24 * 7)["temperature_2m"].dropna()
+    if len(last_week) < 24:
+        return None
+
+    mean_7d = float(last_week.mean())
+    std_7d = float(last_week.std() or 0.0)
+
+    last_humidity = float(history["relative_humidity_2m"].dropna().iloc[-1]) if "relative_humidity_2m" in history else 50.0
+    last_pressure = float(history["surface_pressure"].dropna().iloc[-1]) if "surface_pressure" in history else 1013.0
+
+    hour = target_time.hour
+    doy = target_time.timetuple().tm_yday
+
+    feats = [
+        lat,
+        lon,
+        np.sin(2 * np.pi * hour / 24.0),
+        np.cos(2 * np.pi * hour / 24.0),
+        np.sin(2 * np.pi * doy / 365.25),
+        np.cos(2 * np.pi * doy / 365.25),
+        lag_1,
+        lag_24,
+        lag_168,
+        mean_7d,
+        std_7d,
+        last_humidity,
+        last_pressure,
+    ]
+    return np.array(feats, dtype=float).reshape(1, -1)
+
+
+FEATURE_NAMES = [
+    "lat",
+    "lon",
+    "hour_sin",
+    "hour_cos",
+    "doy_sin",
+    "doy_cos",
+    "lag_1h",
+    "lag_24h",
+    "lag_168h",
+    "mean_7d",
+    "std_7d",
+    "humidity",
+    "pressure",
+]
+
+
+# --- Model loading & prediction ---------------------------------------------
+
+
+_model_cache: Optional[Any] = None
+
+
+def load_model() -> Optional[Any]:
+    """Lazy-load the trained model. Returns None if not trained yet."""
+    global _model_cache
+    if _model_cache is not None:
+        return _model_cache
+    if not os.path.exists(MODEL_PATH):
+        return None
+    _model_cache = joblib.load(MODEL_PATH)
+    return _model_cache
+
+
+def ml_predict_24h(history: pd.DataFrame, lat: float, lon: float) -> list[dict[str, Any]]:
+    """
+    Predict temperature for each of the next 24 hours after the latest
+    observation in `history`. Returns a list of {time, ml_temperature_c}.
+    Empty list if model isn't available or features can't be built.
+    """
+    model = load_model()
+    if model is None or history.empty:
+        return []
+
+    last_obs = history.index.max()
+    out = []
+    for h in range(1, ML_HORIZON_HOURS + 1):
+        target = last_obs + pd.Timedelta(hours=h)
+        feats = build_features(history, lat, lon, target)
+        if feats is None:
+            continue
+        try:
+            pred = float(model.predict(feats)[0])
+        except Exception:
+            continue
+        out.append({"time": target.isoformat(), "ml_temperature_c": round(pred, 2)})
+    return out
+
+
+# --- Public entry point -----------------------------------------------------
+
+
+def get_full_forecast(city: str) -> dict[str, Any]:
+    """
+    Top-level function used by the Flask app.
+
+    Returns a dict with:
+        location: {name, country, latitude, longitude, timezone}
+        current:  {temperature, humidity, precipitation, wind, weather_code}
+        hourly:   list of dicts for the next 7 days (NWP)
+        daily:    list of dicts for the next 7 days (NWP)
+        ml_refinement: list of {time, ml_temp, nwp_temp, blended_temp}
+                       for the next 24 hours (empty if model not trained)
+    """
+    loc = geocode_city(city)
+    nwp = fetch_nwp_forecast(loc["latitude"], loc["longitude"], loc["timezone"])
+
+    hist = fetch_history(loc["latitude"], loc["longitude"], days=14)
+    ml_preds = ml_predict_24h(hist, loc["latitude"], loc["longitude"])
+
+    # Build NWP hourly index for fast lookup of NWP temp at the same hours
+    nwp_hourly = nwp.get("hourly", {})
+    nwp_times = nwp_hourly.get("time", [])
+    nwp_temps = nwp_hourly.get("temperature_2m", [])
+    nwp_temp_by_time = {t: v for t, v in zip(nwp_times, nwp_temps)}
+
+    refinement = []
+    for row in ml_preds:
+        # Open-Meteo forecast 'time' is in the requested timezone (no offset),
+        # while ML times are UTC ISO. Convert ML time to the local naive form.
+        ml_time_utc = pd.to_datetime(row["time"], utc=True)
+        local_naive = ml_time_utc.tz_convert(loc["timezone"]).strftime("%Y-%m-%dT%H:%M")
+        nwp_t = nwp_temp_by_time.get(local_naive)
+        ml_t = row["ml_temperature_c"]
+        if nwp_t is None:
+            continue
+        blended = BLEND_NWP_WEIGHT * nwp_t + BLEND_ML_WEIGHT * ml_t
+        refinement.append(
+            {
+                "time": local_naive,
+                "ml_temperature_c": ml_t,
+                "nwp_temperature_c": round(float(nwp_t), 2),
+                "blended_temperature_c": round(float(blended), 2),
+            }
+        )
+
+    return {
+        "location": loc,
+        "current": nwp.get("current", {}),
+        "current_units": nwp.get("current_units", {}),
+        "hourly": nwp.get("hourly", {}),
+        "hourly_units": nwp.get("hourly_units", {}),
+        "daily": nwp.get("daily", {}),
+        "daily_units": nwp.get("daily_units", {}),
+        "ml_refinement": refinement,
+        "ml_available": load_model() is not None,
+    }
